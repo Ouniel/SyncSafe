@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"image/color"
@@ -15,6 +16,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
@@ -53,23 +55,42 @@ type BackupConfig struct {
 	IsWatching      bool
 	LastBackupTime  time.Time
 	Git             GitConfig
+	History         []BackupRecord
+}
+
+type BackupRecord struct {
+	Timestamp     time.Time
+	SourcePath    string
+	DestPath      string
+	FileCount     int
+	TotalSize     int64
+	Success       bool
+	ErrorMessage  string
+	Duration      time.Duration
+	ModifiedFiles int
+	NewFiles      int
+	DeletedFiles  int
 }
 
 type BackupApp struct {
-	window       fyne.Window
-	config       *BackupConfig
-	statusBar    *widget.Label
-	sourceLabel  *widget.Label
-	destLabel    *widget.Label
-	theme        *CustomTheme
-	sourceFolder *widget.Label
-	destFolder   *widget.Label
-	watcher      *fsnotify.Watcher
-	watchBtn     *widget.Button
-	gitEnabled   *widget.Check
-	backupMutex  sync.Mutex
-	debounceTimer *time.Timer
-	lastBackup    time.Time
+	window            fyne.Window
+	config            *BackupConfig
+	statusBar         *widget.Label
+	sourceLabel       *widget.Label
+	destLabel         *widget.Label
+	theme             *CustomTheme
+	sourceFolder      *widget.Label
+	destFolder        *widget.Label
+	watcher           *fsnotify.Watcher
+	watchBtn          *widget.Button
+	gitEnabled        *widget.Check
+	backupMutex       sync.Mutex
+	debounceTimer     *time.Timer
+	lastBackup        time.Time
+	historyList       *widget.List
+	totalBackupText   *canvas.Text
+	successBackupText *canvas.Text
+	failedBackupText  *canvas.Text
 }
 
 // 自定义主题
@@ -413,6 +434,7 @@ func newBackupApp() *BackupApp {
 			Git: GitConfig{
 				Enabled: false,
 			},
+			History: []BackupRecord{},
 		},
 		statusBar:   widget.NewLabelWithStyle("准备就绪", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 		sourceLabel: widget.NewLabel("未选择源文件夹"),
@@ -548,8 +570,8 @@ func (b *BackupApp) createUI() {
 		b.statusBar,
 	)
 
-	// 创建主布局
-	content := container.NewVBox(
+	// 创建主要标签页
+	mainContainer := container.NewVBox(
 		container.NewPadded(titleContainer),
 		widget.NewSeparator(),
 		buttonGroup,
@@ -575,8 +597,17 @@ func (b *BackupApp) createUI() {
 		),
 	)
 
+	// 创建历史记录标签页
+	historyContainer := b.createHistoryTab()
+
+	// 创建标签页容器
+	tabs := container.NewAppTabs(
+		container.NewTabItem("备份", mainContainer),
+		container.NewTabItem("历史记录", historyContainer),
+	)
+
 	// 设置主窗口内容
-	b.window.SetContent(content)
+	b.window.SetContent(tabs)
 }
 
 func (b *BackupApp) updateStatus(message string) {
@@ -827,6 +858,9 @@ func (b *BackupApp) performBackup() {
 		b.updateStatus("Git 备份完成")
 	}
 
+	// 记录开始时间
+	startTime := time.Now()
+
 	// 创建本地备份文件夹（替换空格为下划线）
 	timestamp := time.Now().Format("2006-01-02_15-04-05")
 	folderName := strings.ReplaceAll(filepath.Base(b.config.SourcePath), " ", "_") + "-" + timestamp
@@ -846,26 +880,49 @@ func (b *BackupApp) performBackup() {
 	}
 
 	// 遍历源文件夹
+	var fileCount int
+	var totalSize int64
+	var newFiles int
+	var modifiedFiles int
+	var deletedFiles int
+
+	// 创建文件映射来跟踪变化
+	oldFiles := make(map[string]os.FileInfo)
+	lastBackupDir := ""
+
+	// 获取最后一次备份的目录
+	if len(b.config.History) > 0 {
+		lastRecord := b.config.History[len(b.config.History)-1]
+		lastBackupDir = lastRecord.DestPath
+		// 只在存在上次备份时才统计文件变化
+		if _, err := os.Stat(lastBackupDir); err == nil {
+			filepath.Walk(lastBackupDir, func(path string, info os.FileInfo, err error) error {
+				if err == nil && !info.IsDir() {
+					relPath, _ := filepath.Rel(lastBackupDir, path)
+					oldFiles[relPath] = info
+				}
+				return nil
+			})
+		}
+	}
+
 	err := filepath.Walk(b.config.SourcePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return fmt.Errorf("访问文件失败: %v\n文件: %s", err, path)
 		}
 
 		// 跳过 .git 目录
-		if info.IsDir() && filepath.Base(path) == ".git" {
+		if info.IsDir() && info.Name() == ".git" {
 			return filepath.SkipDir
 		}
 
-		// 获取相对路径
 		relPath, err := filepath.Rel(b.config.SourcePath, path)
 		if err != nil {
-			return fmt.Errorf("计算相对路径失败: %v\n文件: %s", err, path)
+			return fmt.Errorf("获取相对路径失败: %v", err)
 		}
 
-		// 构建目标路径（替换空格为下划线）
-		destPath := filepath.Join(backupDir, strings.ReplaceAll(relPath, " ", "_"))
+		destPath := filepath.Join(backupDir, relPath)
 
-		// 如果是目录，创建对应的目录
 		if info.IsDir() {
 			if err := os.MkdirAll(destPath, info.Mode()); err != nil {
 				return fmt.Errorf("创建目录失败: %v\n目录: %s", err, destPath)
@@ -873,20 +930,51 @@ func (b *BackupApp) performBackup() {
 			return nil
 		}
 
-		// 复制文件
+		// 检查文件是否存在和是否被修改
+		if oldInfo, exists := oldFiles[relPath]; exists {
+			delete(oldFiles, relPath) // 从映射中删除，剩下的就是要删除的文件
+			if oldInfo.ModTime() != info.ModTime() || oldInfo.Size() != info.Size() {
+				modifiedFiles++
+			}
+		} else {
+			newFiles++
+		}
+
 		if err := b.copyFile(path, destPath); err != nil {
 			return fmt.Errorf("复制文件失败: %v\n源文件: %s\n目标文件: %s", err, path, destPath)
 		}
 
+		fileCount++
+		totalSize += info.Size()
+
 		return nil
 	})
 
-	if err != nil {
-		dialog.ShowError(fmt.Errorf("备份失败: %v", err), b.window)
-		return
+	// 计算删除的文件数
+	deletedFiles = len(oldFiles)
+
+	// 记录备份历史
+	record := BackupRecord{
+		Timestamp:     time.Now(),
+		SourcePath:    b.config.SourcePath,
+		DestPath:      backupDir, // Fix: Use the actual backup directory
+		FileCount:     fileCount,
+		TotalSize:     totalSize,
+		Success:       err == nil,
+		Duration:      time.Since(startTime), // Fix: Use startTime for duration calculation
+		NewFiles:      newFiles,
+		ModifiedFiles: modifiedFiles,
+		DeletedFiles:  deletedFiles,
 	}
 
-	b.updateStatus("备份完成")
+	if err != nil {
+		record.ErrorMessage = err.Error()
+		b.updateStatus("备份失败: " + err.Error())
+	} else {
+		b.updateStatus("备份完成")
+	}
+
+	b.addBackupRecord(record)
 }
 
 func (b *BackupApp) showFolderDialog(title string, callback func(string)) {
@@ -924,6 +1012,261 @@ func (b *BackupApp) showFolderDialog(title string, callback func(string)) {
 
 	// 显示对话框
 	customDialog.Show()
+}
+
+func (b *BackupApp) createHistoryTab() *fyne.Container {
+	// 创建标题
+	title := widget.NewLabelWithStyle("备份历史记录", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+
+	// 创建统计信息卡片
+	successColor := &color.NRGBA{R: 0, G: 180, B: 0, A: 255}
+	failedColor := &color.NRGBA{R: 180, G: 0, B: 0, A: 255}
+
+	// 创建带颜色的文本
+	b.totalBackupText = canvas.NewText(fmt.Sprintf("%d", len(b.config.History)), color.Black)
+	b.totalBackupText.Alignment = fyne.TextAlignCenter
+
+	b.successBackupText = canvas.NewText(fmt.Sprintf("%d", b.getSuccessfulBackupsCount()), *successColor)
+	b.successBackupText.Alignment = fyne.TextAlignCenter
+
+	b.failedBackupText = canvas.NewText(fmt.Sprintf("%d", b.getFailedBackupsCount()), *failedColor)
+	b.failedBackupText.Alignment = fyne.TextAlignCenter
+
+	statsContainer := container.NewHBox(
+		widget.NewCard("", "", container.NewVBox(
+			widget.NewLabelWithStyle("总备份次数", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+			b.totalBackupText,
+		)),
+		widget.NewCard("", "", container.NewVBox(
+			widget.NewLabelWithStyle("成功次数", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+			b.successBackupText,
+		)),
+		widget.NewCard("", "", container.NewVBox(
+			widget.NewLabelWithStyle("失败次数", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+			b.failedBackupText,
+		)),
+	)
+
+	// 创建历史列表
+	b.historyList = widget.NewList(
+		func() int {
+			return len(b.config.History)
+		},
+		func() fyne.CanvasObject {
+			return widget.NewCard("", "", container.NewVBox(
+				// 标题栏
+				container.NewHBox(
+					widget.NewIcon(theme.InfoIcon()),
+					canvas.NewText("", color.Black),
+				),
+				// 路径信息
+				container.NewVBox(
+					container.NewHBox(
+						widget.NewLabelWithStyle("源路径:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+						widget.NewLabel(""),
+					),
+					container.NewHBox(
+						widget.NewLabelWithStyle("目标路径:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+						widget.NewLabel(""),
+					),
+				),
+				// 基本信息
+				container.NewHBox(
+					container.NewVBox(
+						widget.NewLabelWithStyle("文件统计", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+						widget.NewLabel(""),
+					),
+					container.NewVBox(
+						widget.NewLabelWithStyle("文件变更", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+						container.NewHBox(
+							widget.NewLabel(""),
+							widget.NewLabel(""),
+							widget.NewLabel(""),
+						),
+					),
+					container.NewVBox(
+						widget.NewLabelWithStyle("备份信息", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+						widget.NewLabel(""),
+					),
+				),
+			))
+		},
+		func(id widget.ListItemID, item fyne.CanvasObject) {
+			record := b.config.History[len(b.config.History)-1-id]
+			card := item.(*widget.Card)
+			content := card.Content.(*fyne.Container)
+
+			// 设置标题和图标
+			header := content.Objects[0].(*fyne.Container)
+			headerIcon := header.Objects[0].(*widget.Icon)
+			headerText := header.Objects[1].(*canvas.Text)
+			var statusText string
+			if record.Success {
+				headerIcon.SetResource(theme.ConfirmIcon())
+				headerText.Color = *successColor
+				statusText = "成功"
+			} else {
+				headerIcon.SetResource(theme.ErrorIcon())
+				headerText.Color = *failedColor
+				statusText = fmt.Sprintf("失败\n%s", record.ErrorMessage)
+			}
+			headerText.Text = record.Timestamp.Format("2006-01-02 15:04:05")
+			headerText.Refresh()
+
+			// 设置路径信息
+			pathInfo := content.Objects[1].(*fyne.Container)
+			pathInfo.Objects[0].(*fyne.Container).Objects[1].(*widget.Label).SetText(record.SourcePath)
+			pathInfo.Objects[1].(*fyne.Container).Objects[1].(*widget.Label).SetText(record.DestPath)
+
+			// 设置基本信息
+			infoContainer := content.Objects[2].(*fyne.Container)
+			// 文件统计
+			fileStats := infoContainer.Objects[0].(*fyne.Container)
+			fileStats.Objects[1].(*widget.Label).SetText(fmt.Sprintf("总文件: %d\n大小: %.2f MB",
+				record.FileCount,
+				float64(record.TotalSize)/(1024*1024),
+			))
+
+			// 文件变更
+			changeStats := infoContainer.Objects[1].(*fyne.Container)
+			changeBox := changeStats.Objects[1].(*fyne.Container)
+			changeBox.Objects[0].(*widget.Label).SetText(fmt.Sprintf("新增: %d", record.NewFiles))
+			changeBox.Objects[1].(*widget.Label).SetText(fmt.Sprintf("修改: %d", record.ModifiedFiles))
+			changeBox.Objects[2].(*widget.Label).SetText(fmt.Sprintf("删除: %d", record.DeletedFiles))
+
+			// 备份信息
+			backupInfo := infoContainer.Objects[2].(*fyne.Container)
+			backupInfo.Objects[1].(*widget.Label).SetText(fmt.Sprintf("耗时: %v\n状态: %s",
+				record.Duration.Round(time.Millisecond),
+				statusText,
+			))
+		},
+	)
+
+	// 创建按钮容器
+	buttonContainer := container.NewHBox(
+		widget.NewButtonWithIcon("清除历史记录", theme.DeleteIcon(), func() {
+			dialog.ShowConfirm("确认", "是否要清除所有历史记录？", func(ok bool) {
+				if ok {
+					b.config.History = []BackupRecord{}
+					b.historyList.Refresh()
+					b.saveConfig()
+				}
+			}, b.window)
+		}),
+		widget.NewButtonWithIcon("导出历史记录", theme.DocumentSaveIcon(), func() {
+			b.exportHistory()
+		}),
+	)
+
+	// 创建主容器
+	content := container.NewBorder(
+		container.NewVBox(
+			container.NewPadded(title),
+			container.NewPadded(statsContainer),
+			container.NewPadded(buttonContainer),
+		),
+		nil,
+		nil,
+		nil,
+		container.NewPadded(container.NewVScroll(b.historyList)),
+	)
+
+	return content
+}
+
+func (b *BackupApp) getSuccessfulBackupsCount() int {
+	count := 0
+	for _, record := range b.config.History {
+		if record.Success {
+			count++
+		}
+	}
+	return count
+}
+
+func (b *BackupApp) getFailedBackupsCount() int {
+	return len(b.config.History) - b.getSuccessfulBackupsCount()
+}
+
+func (b *BackupApp) filterHistoryList(searchText string) {
+	if searchText == "" {
+		b.historyList.Refresh()
+		return
+	}
+
+	searchText = strings.ToLower(searchText)
+	b.historyList.Refresh()
+}
+
+func (b *BackupApp) exportHistory() {
+	dialog.ShowFileSave(func(writer fyne.URIWriteCloser, err error) {
+		if err != nil {
+			dialog.ShowError(err, b.window)
+			return
+		}
+		if writer == nil {
+			return
+		}
+		defer writer.Close()
+
+		// 创建CSV writer
+		csvWriter := csv.NewWriter(writer)
+		defer csvWriter.Flush()
+
+		// 写入表头
+		headers := []string{
+			"时间", "源路径", "目标路径", "总文件数", "总大小(MB)",
+			"新增文件数", "修改文件数", "删除文件数",
+			"耗时(ms)", "状态", "错误信息",
+		}
+		csvWriter.Write(headers)
+
+		// 写入数据
+		for _, record := range b.config.History {
+			status := "成功"
+			if !record.Success {
+				status = "失败"
+			}
+
+			row := []string{
+				record.Timestamp.Format("2006-01-02 15:04:05"),
+				record.SourcePath,
+				record.DestPath,
+				fmt.Sprintf("%d", record.FileCount),
+				fmt.Sprintf("%.2f", float64(record.TotalSize)/(1024*1024)),
+				fmt.Sprintf("%d", record.NewFiles),
+				fmt.Sprintf("%d", record.ModifiedFiles),
+				fmt.Sprintf("%d", record.DeletedFiles),
+				fmt.Sprintf("%d", record.Duration.Milliseconds()),
+				status,
+				record.ErrorMessage,
+			}
+			csvWriter.Write(row)
+		}
+	}, b.window)
+}
+
+func (b *BackupApp) addBackupRecord(record BackupRecord) {
+	b.config.History = append(b.config.History, record)
+	if b.historyList != nil {
+		b.historyList.Refresh()
+		// Update statistics text
+		if b.totalBackupText != nil {
+			b.totalBackupText.Text = fmt.Sprintf("%d", len(b.config.History))
+			b.totalBackupText.Refresh()
+		}
+		if b.successBackupText != nil {
+			b.successBackupText.Text = fmt.Sprintf("%d", b.getSuccessfulBackupsCount())
+			b.successBackupText.Refresh()
+		}
+		if b.failedBackupText != nil {
+			b.failedBackupText.Text = fmt.Sprintf("%d", b.getFailedBackupsCount())
+			b.failedBackupText.Refresh()
+		}
+	}
+	// Save config to persist the history
+	b.saveConfig()
 }
 
 func main() {
