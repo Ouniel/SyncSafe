@@ -427,6 +427,32 @@ func (b *BackupApp) saveConfig() error {
 	return nil
 }
 
+// 从文件加载配置
+func (b *BackupApp) loadConfig() error {
+	configDir := filepath.Join(".", "syncsafe")
+	configPath := filepath.Join(configDir, "config.json")
+
+	// 检查配置文件是否存在
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return nil
+	}
+
+	// 读取配置文件
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("读取配置文件失败: %v", err)
+	}
+
+	// 解析配置
+	var config BackupConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return fmt.Errorf("解析配置文件失败: %v", err)
+	}
+
+	b.config = &config
+	return nil
+}
+
 func newBackupApp() *BackupApp {
 	app := &BackupApp{
 		config: &BackupConfig{
@@ -434,7 +460,7 @@ func newBackupApp() *BackupApp {
 			Git: GitConfig{
 				Enabled: false,
 			},
-			History: []BackupRecord{},
+			History: make([]BackupRecord, 0),
 		},
 		statusBar:   widget.NewLabelWithStyle("准备就绪", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 		sourceLabel: widget.NewLabel("未选择源文件夹"),
@@ -1281,6 +1307,11 @@ func main() {
 	backupApp := newBackupApp()
 	backupApp.window = window
 	backupApp.createUI()
+
+	// 加载配置
+	if err := backupApp.loadConfig(); err != nil {
+		dialog.ShowError(err, window)
+	}
 
 	window.ShowAndRun()
 }
