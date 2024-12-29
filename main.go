@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -66,6 +67,9 @@ type BackupApp struct {
 	watcher      *fsnotify.Watcher
 	watchBtn     *widget.Button
 	gitEnabled   *widget.Check
+	backupMutex  sync.Mutex
+	debounceTimer *time.Timer
+	lastBackup    time.Time
 }
 
 // 自定义主题
@@ -599,6 +603,10 @@ func (b *BackupApp) startWatching() error {
 			return err
 		}
 		if info.IsDir() {
+			// 跳过.git目录
+			if filepath.Base(path) == ".git" {
+				return filepath.SkipDir
+			}
 			err = watcher.Add(path)
 			if err != nil {
 				return fmt.Errorf("添加监控目录失败 %s: %v", path, err)
@@ -617,6 +625,7 @@ func (b *BackupApp) startWatching() error {
 
 	// 启动监控协程
 	go func() {
+		const debounceDelay = 5 * time.Second // 防抖动延迟时间
 		for {
 			select {
 			case event, ok := <-watcher.Events:
@@ -627,8 +636,26 @@ func (b *BackupApp) startWatching() error {
 					event.Op&fsnotify.Create == fsnotify.Create ||
 					event.Op&fsnotify.Remove == fsnotify.Remove ||
 					event.Op&fsnotify.Rename == fsnotify.Rename {
-					// 当检测到文件变化时，执行备份
-					go b.performBackup()
+					// 实现防抖动：取消之前的定时器（如果存在）
+					if b.debounceTimer != nil {
+						b.debounceTimer.Stop()
+					}
+
+					// 创建新的定时器
+					b.debounceTimer = time.AfterFunc(debounceDelay, func() {
+						// 检查距离上次备份的时间间隔
+						if time.Since(b.lastBackup) < debounceDelay {
+							return
+						}
+						// 尝试获取互斥锁
+						if !b.backupMutex.TryLock() {
+							b.updateStatus("已有备份正在进行中...")
+							return
+						}
+						defer b.backupMutex.Unlock()
+						b.performBackup()
+						b.lastBackup = time.Now()
+					})
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
